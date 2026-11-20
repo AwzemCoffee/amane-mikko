@@ -41,6 +41,30 @@ pub fn set_default(family: &str) {
     *default_family = String::from(family);
 }
 
+/// Registers an in-memory font file under `family` for all weights, bypassing fontconfig.
+pub fn register(family: &str, bytes: &'static [u8]) -> bool {
+    let Some(font) = FontRef::from_index(bytes, 0) else {
+        return false;
+    };
+
+    let mut loaded = LOADED.lock().unwrap_or_else(PoisonError::into_inner);
+    for weight in [
+        Weight::Thin,
+        Weight::ExtraLight,
+        Weight::Light,
+        Weight::Regular,
+        Weight::Medium,
+        Weight::SemiBold,
+        Weight::Bold,
+        Weight::ExtraBold,
+        Weight::Black,
+    ] {
+        loaded.insert(format!("{family} {}", weight.style()), font);
+    }
+
+    true
+}
+
 pub fn load_weighted(family: Option<&str>, weight: Weight) -> FontRef<'static> {
     let family = match family {
         Some(family) => String::from(family),
