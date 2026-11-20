@@ -2,8 +2,6 @@ mod dbus_menu;
 mod icon;
 mod watcher;
 
-use zbus::blocking::Connection;
-
 use crate::Service;
 use crate::services::worker;
 
@@ -122,23 +120,11 @@ impl Tray {
 
     /// Fetches the current `com.canonical.dbusmenu` layout for a tray item.
     pub fn menu(id: &str) -> Vec<TrayMenuItem> {
-        let target = {
-            let tray = Self::read();
-            tray.items
-                .iter()
-                .find(|item| item.id == id)
-                .and_then(|item| {
-                    item.menu_path
-                        .as_ref()
-                        .map(|menu| (item.service.clone(), menu.clone()))
-                })
-        };
-
-        let Some((service, menu_path)) = target else {
+        let Some((service, menu_path)) = Self::lookup_menu(id) else {
             return Vec::new();
         };
 
-        let Ok(connection) = Connection::session() else {
+        let Some(connection) = watcher::shared_session() else {
             return Vec::new();
         };
 
@@ -146,24 +132,12 @@ impl Tray {
     }
 
     pub fn menu_click(id: &str, menu_item_id: i32) {
-        let target = {
-            let tray = Self::read();
-            tray.items
-                .iter()
-                .find(|item| item.id == id)
-                .and_then(|item| {
-                    item.menu_path
-                        .as_ref()
-                        .map(|menu| (item.service.clone(), menu.clone()))
-                })
-        };
-
-        let Some((service, menu_path)) = target else {
+        let Some((service, menu_path)) = Self::lookup_menu(id) else {
             return;
         };
 
         worker::run(move || {
-            if let Ok(connection) = Connection::session() {
+            if let Some(connection) = watcher::shared_session() {
                 dbus_menu::send_click(&connection, &service, &menu_path, menu_item_id);
             }
         });
@@ -177,22 +151,19 @@ impl Tray {
             .map(|item| (item.service.clone(), item.object_path.clone()))
     }
 
-    fn upsert(&mut self, item: TrayItem) {
-        if let Some(existing) = self.items.iter_mut().find(|old| old.id == item.id) {
-            if existing.icon_path != item.icon_path {
-                icon::remove_temp(&existing.icon_path);
-            }
-            *existing = item;
-            return;
-        }
-
-        self.items.push(item);
+    fn lookup_menu(id: &str) -> Option<(String, String)> {
+        let tray = Self::read();
+        tray.items
+            .iter()
+            .find(|item| item.id == id)
+            .and_then(|item| {
+                item.menu_path
+                    .as_ref()
+                    .map(|menu| (item.service.clone(), menu.clone()))
+            })
     }
 
-    fn remove(&mut self, id: &str) {
-        if let Some(index) = self.items.iter().position(|item| item.id == id) {
-            let removed = self.items.remove(index);
-            icon::remove_temp(&removed.icon_path);
-        }
+    fn set_items(&mut self, items: Vec<TrayItem>) {
+        self.items = items;
     }
 }

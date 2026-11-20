@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::process;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 
 use zbus::blocking::{Connection, MessageIterator, Proxy};
@@ -8,7 +8,8 @@ use zbus::message::{Header, Type as MessageType};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
-use super::{Tray, TrayItem, icon};
+use super::icon::IconStore;
+use super::{Tray, TrayItem};
 use crate::Service;
 
 const WATCHER_NAME: &str = "org.kde.StatusNotifierWatcher";
@@ -17,7 +18,15 @@ const WATCHER_IFACE: &str = "org.kde.StatusNotifierWatcher";
 const ITEM_IFACE: &str = "org.kde.StatusNotifierItem";
 const DEFAULT_ITEM_PATH: &str = "/StatusNotifierItem";
 
-#[derive(Debug)]
+static SHARED_SESSION: OnceLock<Option<Connection>> = OnceLock::new();
+
+pub fn shared_session() -> Option<Connection> {
+    SHARED_SESSION
+        .get_or_init(|| Connection::session().ok())
+        .clone()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WatcherEvent {
     Registered(String),
     Unregistered(String),
@@ -25,14 +34,163 @@ enum WatcherEvent {
     OwnerVanished(String),
 }
 
-struct WatcherState {
-    items: Vec<String>,
+/// Internal seam separating SNI registry logic from live session D-Bus I/O.
+trait TrayBus {
+    fn fetch_properties(&self, service: &str, path: &str) -> Option<HashMap<String, OwnedValue>>;
+    fn emit_unregistered(&self, full_id: &str);
+}
+
+struct ZbusAdapter<'a> {
+    connection: &'a Connection,
+    owned_watcher: bool,
+}
+
+impl TrayBus for ZbusAdapter<'_> {
+    fn fetch_properties(&self, service: &str, path: &str) -> Option<HashMap<String, OwnedValue>> {
+        let proxy = Proxy::new(
+            self.connection,
+            service,
+            path,
+            "org.freedesktop.DBus.Properties",
+        )
+        .ok()?;
+        proxy.call("GetAll", &(ITEM_IFACE)).ok()
+    }
+
+    fn emit_unregistered(&self, full_id: &str) {
+        if !self.owned_watcher {
+            return;
+        }
+        let Ok(iface_ref) = self
+            .connection
+            .object_server()
+            .interface::<_, StatusNotifierWatcher>(WATCHER_PATH)
+        else {
+            return;
+        };
+        let emitter = iface_ref.signal_emitter();
+        let _ = zbus::block_on(StatusNotifierWatcher::status_notifier_item_unregistered(
+            emitter, full_id,
+        ));
+    }
+}
+
+/// Authoritative in-memory registry of active SNI items and their temp icons.
+struct TrayRegistry {
+    items: Vec<TrayItem>,
+    icons: IconStore,
+}
+
+impl TrayRegistry {
+    fn new(icons: IconStore) -> Self {
+        Self {
+            items: Vec::new(),
+            icons,
+        }
+    }
+
+    fn registered_ids(&self) -> Vec<String> {
+        self.items.iter().map(|item| item.id.clone()).collect()
+    }
+
+    fn contains(&self, full_id: &str) -> bool {
+        self.items.iter().any(|item| item.id == full_id)
+    }
+
+    fn items_snapshot(&self) -> Vec<TrayItem> {
+        self.items.clone()
+    }
+
+    fn handle_event(&mut self, event: WatcherEvent, bus: &dyn TrayBus) -> bool {
+        match event {
+            WatcherEvent::Registered(full_id) => {
+                let Some((service, path)) = split_item_id(&full_id) else {
+                    return false;
+                };
+                let Some(props) = bus.fetch_properties(&service, &path) else {
+                    return false;
+                };
+                let item = decode_item(&full_id, &service, &path, &props, &self.icons);
+                self.upsert(item);
+                true
+            }
+            WatcherEvent::Unregistered(full_id) => self.remove(&full_id),
+            WatcherEvent::RefreshService(sender) => {
+                let matching: Vec<(String, String, String)> = self
+                    .items
+                    .iter()
+                    .filter(|item| item.service == sender)
+                    .map(|item| {
+                        (
+                            item.id.clone(),
+                            item.service.clone(),
+                            item.object_path.clone(),
+                        )
+                    })
+                    .collect();
+
+                let mut changed = false;
+                for (full_id, service, path) in matching {
+                    if let Some(props) = bus.fetch_properties(&service, &path) {
+                        let item = decode_item(&full_id, &service, &path, &props, &self.icons);
+                        self.upsert(item);
+                        changed = true;
+                    }
+                }
+                changed
+            }
+            WatcherEvent::OwnerVanished(name) => {
+                let vanished: Vec<String> = self
+                    .items
+                    .iter()
+                    .filter(|item| item.service == name)
+                    .map(|item| item.id.clone())
+                    .collect();
+
+                if vanished.is_empty() {
+                    return false;
+                }
+
+                for full_id in vanished {
+                    if self.remove(&full_id) {
+                        bus.emit_unregistered(&full_id);
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    fn upsert(&mut self, item: TrayItem) {
+        if let Some(existing) = self.items.iter_mut().find(|old| old.id == item.id) {
+            if existing.icon_path != item.icon_path {
+                self.icons.remove_temp(&existing.icon_path);
+            }
+            *existing = item;
+            return;
+        }
+
+        self.items.push(item);
+    }
+
+    fn remove(&mut self, id: &str) -> bool {
+        let Some(index) = self.items.iter().position(|item| item.id == id) else {
+            return false;
+        };
+        let removed = self.items.remove(index);
+        self.icons.remove_temp(&removed.icon_path);
+        true
+    }
+}
+
+struct WatcherShared {
+    registry: TrayRegistry,
     hosts: Vec<String>,
     tx: mpsc::Sender<WatcherEvent>,
 }
 
 struct StatusNotifierWatcher {
-    state: Arc<Mutex<WatcherState>>,
+    shared: Arc<Mutex<WatcherShared>>,
 }
 
 #[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
@@ -48,20 +206,19 @@ impl StatusNotifierWatcher {
             return;
         };
 
-        let inserted = {
-            let Ok(mut state) = self.state.lock() else {
+        let should_register = {
+            let Ok(shared) = self.shared.lock() else {
                 return;
             };
-            if state.items.contains(&full_id) {
+            if shared.registry.contains(&full_id) {
                 false
             } else {
-                state.items.push(full_id.clone());
-                let _ = state.tx.send(WatcherEvent::Registered(full_id.clone()));
+                let _ = shared.tx.send(WatcherEvent::Registered(full_id.clone()));
                 true
             }
         };
 
-        if inserted {
+        if should_register {
             let _ = Self::status_notifier_item_registered(&emitter, &full_id).await;
         }
     }
@@ -72,13 +229,13 @@ impl StatusNotifierWatcher {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) {
         let inserted = {
-            let Ok(mut state) = self.state.lock() else {
+            let Ok(mut shared) = self.shared.lock() else {
                 return;
             };
-            if state.hosts.iter().any(|h| h == service) {
+            if shared.hosts.iter().any(|h| h == service) {
                 false
             } else {
-                state.hosts.push(service.to_string());
+                shared.hosts.push(service.to_string());
                 true
             }
         };
@@ -90,9 +247,9 @@ impl StatusNotifierWatcher {
 
     #[zbus(property)]
     fn registered_status_notifier_items(&self) -> Vec<String> {
-        self.state
+        self.shared
             .lock()
-            .map(|state| state.items.clone())
+            .map(|shared| shared.registry.registered_ids())
             .unwrap_or_default()
     }
 
@@ -124,14 +281,15 @@ impl StatusNotifierWatcher {
 
 pub fn run() {
     let (tx, rx) = mpsc::channel();
-    let state = Arc::new(Mutex::new(WatcherState {
-        items: Vec::new(),
-        hosts: vec![format!("org.kde.StatusNotifierHost-{}", process::id())],
+    let host_name = format!("org.kde.StatusNotifierHost-{}", process::id());
+    let shared = Arc::new(Mutex::new(WatcherShared {
+        registry: TrayRegistry::new(IconStore::from_env()),
+        hosts: vec![host_name.clone()],
         tx: tx.clone(),
     }));
 
     let watcher = StatusNotifierWatcher {
-        state: Arc::clone(&state),
+        shared: Arc::clone(&shared),
     };
 
     let Ok(connection) = zbus::blocking::connection::Builder::session()
@@ -141,9 +299,7 @@ pub fn run() {
         return;
     };
 
-    let host_name = format!("org.kde.StatusNotifierHost-{}", process::id());
     let _ = connection.request_name(host_name.as_str());
-
     let owned_watcher = connection.request_name(WATCHER_NAME).is_ok();
 
     Tray::write().running = true;
@@ -157,59 +313,25 @@ pub fn run() {
     let signal_tx = tx.clone();
     thread::spawn(move || listen_signals(signal_tx, !owned_watcher));
 
-    // Event processing loop: fetch item properties and update Tray service reactively
-    let mut active_items: HashMap<String, (String, String)> = HashMap::new();
+    let bus = ZbusAdapter {
+        connection: &connection,
+        owned_watcher,
+    };
 
     for event in rx {
-        match event {
-            WatcherEvent::Registered(full_id) => {
-                let Some((service, path)) = split_item_id(&full_id) else {
-                    continue;
-                };
-                active_items.insert(full_id.clone(), (service.clone(), path.clone()));
-                if let Some(item) = fetch_item(&connection, &full_id, &service, &path) {
-                    Tray::write().upsert(item);
-                }
+        let updated = {
+            let Ok(mut guard) = shared.lock() else {
+                continue;
+            };
+            if guard.registry.handle_event(event, &bus) {
+                Some(guard.registry.items_snapshot())
+            } else {
+                None
             }
-            WatcherEvent::Unregistered(full_id) => {
-                active_items.remove(&full_id);
-                if owned_watcher
-                    && let Ok(mut guard) = state.lock()
-                {
-                    guard.items.retain(|id| id != &full_id);
-                }
-                Tray::write().remove(&full_id);
-            }
-            WatcherEvent::RefreshService(sender) => {
-                let matching: Vec<(String, String, String)> = active_items
-                    .iter()
-                    .filter(|(_, (svc, _))| svc == &sender)
-                    .map(|(id, (svc, path))| (id.clone(), svc.clone(), path.clone()))
-                    .collect();
+        };
 
-                for (full_id, service, path) in matching {
-                    if let Some(item) = fetch_item(&connection, &full_id, &service, &path) {
-                        Tray::write().upsert(item);
-                    }
-                }
-            }
-            WatcherEvent::OwnerVanished(name) => {
-                let vanished: Vec<String> = active_items
-                    .iter()
-                    .filter(|(_, (svc, _))| svc == &name)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-
-                for full_id in vanished {
-                    active_items.remove(&full_id);
-                    if owned_watcher
-                        && let Ok(mut guard) = state.lock()
-                    {
-                        guard.items.retain(|id| id != &full_id);
-                    }
-                    Tray::write().remove(&full_id);
-                }
-            }
+        if let Some(items) = updated {
+            Tray::write().set_items(items);
         }
     }
 }
@@ -305,15 +427,13 @@ fn listen_signals(tx: mpsc::Sender<WatcherEvent>, watch_external_watcher: bool) 
     }
 }
 
-fn fetch_item(
-    connection: &Connection,
+fn decode_item(
     full_id: &str,
     service: &str,
     path: &str,
-) -> Option<TrayItem> {
-    let proxy = Proxy::new(connection, service, path, "org.freedesktop.DBus.Properties").ok()?;
-    let props: HashMap<String, OwnedValue> = proxy.call("GetAll", &(ITEM_IFACE)).ok()?;
-
+    props: &HashMap<String, OwnedValue>,
+    icons: &IconStore,
+) -> TrayItem {
     let str_prop = |key: &str| -> String {
         props
             .get(key)
@@ -345,9 +465,8 @@ fn fetch_item(
     };
 
     let icon_theme_path = str_prop("IconThemePath");
-
     let pixmaps = extract_pixmaps(props.get("IconPixmap"));
-    let icon_path = icon::resolve(&icon_name, &icon_theme_path, &pixmaps);
+    let icon_path = icons.resolve(&icon_name, &icon_theme_path, &pixmaps);
 
     let menu_path = props
         .get("Menu")
@@ -360,7 +479,7 @@ fn fetch_item(
         .and_then(|v| bool::try_from(v).ok())
         .unwrap_or(false);
 
-    Some(TrayItem {
+    TrayItem {
         id: full_id.to_string(),
         service: service.to_string(),
         object_path: path.to_string(),
@@ -371,7 +490,7 @@ fn fetch_item(
         status,
         menu_path,
         item_is_menu,
-    })
+    }
 }
 
 fn extract_pixmaps(value: Option<&OwnedValue>) -> Vec<(i32, i32, Vec<u8>)> {
@@ -385,7 +504,7 @@ fn extract_pixmaps(value: Option<&OwnedValue>) -> Vec<(i32, i32, Vec<u8>)> {
 }
 
 pub fn call_item_method(service: &str, object_path: &str, method: &str, x: i32, y: i32) {
-    let Ok(connection) = Connection::session() else {
+    let Some(connection) = shared_session() else {
         return;
     };
     let Ok(proxy) = Proxy::new(&connection, service, object_path, ITEM_IFACE) else {
@@ -395,7 +514,7 @@ pub fn call_item_method(service: &str, object_path: &str, method: &str, x: i32, 
 }
 
 pub fn call_item_scroll(service: &str, object_path: &str, delta: i32, horizontal: bool) {
-    let Ok(connection) = Connection::session() else {
+    let Some(connection) = shared_session() else {
         return;
     };
     let Ok(proxy) = Proxy::new(&connection, service, object_path, ITEM_IFACE) else {
@@ -434,7 +553,70 @@ pub fn split_item_id(full_id: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::env;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use zbus::zvariant::{ObjectPath, Value};
+
     use super::*;
+
+    static TEST_SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!("amane-watcher-test-{tag}-{}-{seq}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[derive(Default)]
+    struct FakeTrayBus {
+        props: HashMap<(String, String), HashMap<String, OwnedValue>>,
+        unregistered: RefCell<Vec<String>>,
+    }
+
+    impl FakeTrayBus {
+        fn set_item(&mut self, service: &str, path: &str, props: HashMap<String, OwnedValue>) {
+            self.props
+                .insert((service.to_string(), path.to_string()), props);
+        }
+    }
+
+    impl TrayBus for FakeTrayBus {
+        fn fetch_properties(
+            &self,
+            service: &str,
+            path: &str,
+        ) -> Option<HashMap<String, OwnedValue>> {
+            let map = self.props.get(&(service.to_string(), path.to_string()))?;
+            let mut cloned = HashMap::with_capacity(map.len());
+            for (k, v) in map {
+                cloned.insert(k.clone(), v.try_clone().ok()?);
+            }
+            Some(cloned)
+        }
+
+        fn emit_unregistered(&self, full_id: &str) {
+            self.unregistered.borrow_mut().push(full_id.to_string());
+        }
+    }
+
+    fn base_props(title: &str, status: &str, pixmap_argb: [u8; 4]) -> HashMap<String, OwnedValue> {
+        let mut props = HashMap::new();
+        props.insert("Id".into(), Value::from("discord").try_into().unwrap());
+        props.insert("Title".into(), Value::from(title).try_into().unwrap());
+        props.insert("Status".into(), Value::from(status).try_into().unwrap());
+        props.insert(
+            "IconPixmap".into(),
+            Value::from(vec![(1i32, 1i32, pixmap_argb.to_vec())])
+                .try_into()
+                .unwrap(),
+        );
+        props
+    }
 
     #[test]
     fn normalizes_and_splits_sni_item_ids() {
@@ -459,5 +641,70 @@ mod tests {
             ))
         );
         assert_eq!(split_item_id("invalid-no-slash"), None);
+    }
+
+    #[test]
+    fn registry_lifecycle_cleans_temp_icons_and_emits_unregistered_on_vanish() {
+        let dir = temp_dir("lifecycle");
+        let mut registry = TrayRegistry::new(IconStore::with_dirs(dir.clone(), Vec::new()));
+        let mut bus = FakeTrayBus::default();
+
+        let mut props = base_props("Discord", "Active", [0xff, 0x10, 0x20, 0x30]);
+        props.insert(
+            "Menu".into(),
+            Value::from(ObjectPath::try_from("/NO_DBUSMENU").unwrap())
+                .try_into()
+                .unwrap(),
+        );
+        bus.set_item(":1.42", "/StatusNotifierItem", props);
+
+        assert!(registry.handle_event(
+            WatcherEvent::Registered(":1.42/StatusNotifierItem".into()),
+            &bus
+        ));
+        assert_eq!(registry.registered_ids(), vec![":1.42/StatusNotifierItem"]);
+
+        let first_icon = registry.items_snapshot()[0]
+            .icon_path
+            .clone()
+            .expect("temp icon saved");
+        assert!(Path::new(&first_icon).exists());
+        assert!(!registry.items_snapshot()[0].has_menu());
+
+        // Refresh replaces the pixmap and deletes the previous temp PNG
+        let mut updated = base_props("Discord (1)", "NeedsAttention", [0xff, 0xaa, 0xbb, 0xcc]);
+        updated.insert("IconName".into(), Value::from("fallback-icon").try_into().unwrap());
+        updated.insert(
+            "AttentionIconName".into(),
+            Value::from("").try_into().unwrap(),
+        );
+        updated.insert(
+            "Menu".into(),
+            Value::from(ObjectPath::try_from("/MenuBar").unwrap())
+                .try_into()
+                .unwrap(),
+        );
+        bus.set_item(":1.42", "/StatusNotifierItem", updated);
+
+        assert!(registry.handle_event(WatcherEvent::RefreshService(":1.42".into()), &bus));
+        assert!(!Path::new(&first_icon).exists());
+
+        let item = &registry.items_snapshot()[0];
+        assert_eq!(item.title(), "Discord (1)");
+        assert_eq!(item.icon_name(), "fallback-icon");
+        assert!(item.has_menu());
+        let second_icon = item.icon_path.clone().expect("second temp icon saved");
+        assert!(Path::new(&second_icon).exists());
+
+        // Owner vanishing removes the item, deletes temp icon, and emits unregistered
+        assert!(registry.handle_event(WatcherEvent::OwnerVanished(":1.42".into()), &bus));
+        assert!(registry.items_snapshot().is_empty());
+        assert!(!Path::new(&second_icon).exists());
+        assert_eq!(
+            *bus.unregistered.borrow(),
+            vec![":1.42/StatusNotifierItem".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

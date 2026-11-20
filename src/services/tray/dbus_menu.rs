@@ -134,11 +134,62 @@ pub fn strip_mnemonic(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zbus::zvariant::StructureBuilder;
+
+    fn make_node(
+        id: i32,
+        props: HashMap<String, OwnedValue>,
+        children: Vec<OwnedValue>,
+    ) -> OwnedValue {
+        let structure = StructureBuilder::new()
+            .add_field(id)
+            .add_field(props)
+            .add_field(children)
+            .build()
+            .unwrap();
+        OwnedValue::try_from(Value::Structure(structure)).unwrap()
+    }
 
     #[test]
     fn strips_dbusmenu_mnemonics() {
         assert_eq!(strip_mnemonic("_Quit"), "Quit");
         assert_eq!(strip_mnemonic("Open _Settings"), "Open Settings");
         assert_eq!(strip_mnemonic("Keep__Underscore"), "Keep_Underscore");
+    }
+
+    #[test]
+    fn parses_dbusmenu_nodes_toggles_separators_and_visibility() {
+        let mut child_hidden_props = HashMap::new();
+        child_hidden_props.insert("label".into(), Value::from("Hidden").try_into().unwrap());
+        child_hidden_props.insert("visible".into(), Value::from(false).try_into().unwrap());
+        let hidden_child = make_node(2, child_hidden_props, Vec::new());
+
+        let mut sep_props = HashMap::new();
+        sep_props.insert("type".into(), Value::from("separator").try_into().unwrap());
+        let sep_child = make_node(3, sep_props, Vec::new());
+
+        let mut root_props = HashMap::new();
+        root_props.insert("label".into(), Value::from("_Mute").try_into().unwrap());
+        root_props.insert("enabled".into(), Value::from(true).try_into().unwrap());
+        root_props.insert(
+            "toggle-type".into(),
+            Value::from("checkmark").try_into().unwrap(),
+        );
+        root_props.insert("toggle-state".into(), Value::from(1i32).try_into().unwrap());
+
+        let parsed = parse_node(make_node(1, root_props, vec![hidden_child, sep_child]))
+            .expect("should parse node");
+
+        assert_eq!(parsed.id, 1);
+        assert_eq!(parsed.label, "Mute");
+        assert!(parsed.enabled);
+        assert!(parsed.visible);
+        assert!(!parsed.is_separator);
+        assert_eq!(parsed.toggle_type.as_deref(), Some("checkmark"));
+        assert_eq!(parsed.toggle_state, 1);
+        // Hidden child filtered out, separator kept
+        assert_eq!(parsed.children.len(), 1);
+        assert_eq!(parsed.children[0].id, 3);
+        assert!(parsed.children[0].is_separator);
     }
 }
