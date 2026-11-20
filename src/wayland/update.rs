@@ -50,6 +50,11 @@ impl OpenWindow {
             return;
         }
 
+        // a hidden window whose layer surface was destroyed will be materialized by WaylandState
+        let Some(layer_surface) = layer_surface.as_ref() else {
+            return;
+        };
+
         /*
          * a commit without a buffer also shows a hidden window again,
          * the compositor answers with a configure and drawing starts there
@@ -67,7 +72,13 @@ impl OpenWindow {
 
         self.input_region = window.input_region.clone();
 
-        let surface = self.role.wl_surface();
+        self.apply_input_region();
+    }
+
+    pub fn apply_input_region(&self) {
+        let Some(surface) = self.role.wl_surface() else {
+            return;
+        };
 
         // no region set means the whole window takes the pointer again
         let Some(areas) = &self.input_region else {
@@ -90,17 +101,26 @@ impl OpenWindow {
     }
 
     fn hide(&mut self) {
-        // taking the buffer away unmaps the window and gives back its reserved space
-        self.role.wl_surface().attach(None, 0, 0);
+        /*
+         * destroy the gpu surface, fractional scale, and layer surface in order;
+         * unmapping with attach(None) while keeping zwlr_layer_surface_v1 alive races
+         * with in-flight configures that sctk unconditionally acks after wlroots clears
+         * its configure list, causing fatal INVALID_SURFACE_STATE protocol errors
+         */
+        self.gpu = None;
+        self.fractional = None;
+        if let Role::Layer { surface, .. } = &mut self.role {
+            *surface = None;
+        }
 
-        self.role.commit();
-
-        // nothing is drawn until showing the window brings a new configure
+        // nothing is drawn until showing the window recreates the surface and configures it
         self.width = 0;
         self.height = 0;
 
-        // a frame callback asked for before hiding may never come
+        // a frame callback asked for before hiding will never come
         self.frame_requested = false;
+        self.on_key = None;
+        self.pointer = crate::input::Pointer::default();
     }
 }
 

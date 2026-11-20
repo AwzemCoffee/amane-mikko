@@ -87,8 +87,10 @@ impl WaylandState {
             let mut surfaces = Vec::new();
 
             for window in &self.windows {
-                if window.view.shows(name) {
-                    surfaces.push(window.role.wl_surface().clone());
+                if window.view.shows(name)
+                    && let Some(surface) = window.role.wl_surface()
+                {
+                    surfaces.push(surface.clone());
                 }
             }
 

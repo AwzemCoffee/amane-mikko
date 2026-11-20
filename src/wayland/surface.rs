@@ -52,7 +52,7 @@ pub struct OpenWindow {
     pub on_key: Option<KeyHandler>,
 
     // the gpu draws into the surface, so it has to go first when both are dropped
-    pub gpu: Gpu,
+    pub gpu: Option<Gpu>,
 
     // none at whole scales; dropped before the role, since it belongs to its surface
     pub fractional: Option<Fractional>,
@@ -68,7 +68,8 @@ pub struct OpenWindow {
 // what a window is to the compositor: a layer like a bar, one screen of the session lock, or a normal window
 pub enum Role {
     Layer {
-        surface: LayerSurface,
+        // none while hidden: destroying the layer surface avoids racing with in-flight configures
+        surface: Option<LayerSurface>,
 
         // what the compositor was last told, so only a real change is sent again
         settings: Settings,
@@ -105,6 +106,12 @@ pub enum Content {
 impl OpenWindow {
     // a size of 0 leaves the choice to the window, which then keeps the size it asked for
     pub fn resize(&mut self, width: u32, height: u32) {
+        // an in-flight configure can still arrive after hide() unmaps the layer surface;
+        // ignore it so width/height stay 0 and we never commit a frameless update while hidden
+        if matches!(&self.role, Role::Layer { settings, .. } if !settings.visible) {
+            return;
+        }
+
         let (asked_width, asked_height) = self.asked_size();
 
         self.width = match width {
@@ -118,6 +125,10 @@ impl OpenWindow {
         };
 
         self.redraw();
+    }
+
+    pub fn needs_layer_surface(&self) -> bool {
+        matches!(&self.role, Role::Layer { surface: None, settings } if settings.visible)
     }
 
     fn asked_size(&self) -> (u32, u32) {
@@ -138,16 +149,18 @@ impl OpenWindow {
 }
 
 impl Role {
-    pub fn wl_surface(&self) -> &WlSurface {
+    pub fn wl_surface(&self) -> Option<&WlSurface> {
         match self {
-            Role::Layer { surface, .. } => surface.wl_surface(),
-            Role::Lock(lock_surface) => lock_surface.wl_surface(),
-            Role::Normal { window, .. } => window.wl_surface(),
+            Role::Layer { surface, .. } => surface.as_ref().map(WaylandSurface::wl_surface),
+            Role::Lock(lock_surface) => Some(lock_surface.wl_surface()),
+            Role::Normal { window, .. } => Some(window.wl_surface()),
         }
     }
 
     pub fn commit(&self) {
-        self.wl_surface().commit();
+        if let Some(surface) = self.wl_surface() {
+            surface.commit();
+        }
     }
 }
 

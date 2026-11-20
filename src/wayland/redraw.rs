@@ -116,9 +116,11 @@ impl OpenWindow {
             return;
         }
 
-        self.frame_requested = true;
+        let Some(surface) = self.role.wl_surface() else {
+            return;
+        };
 
-        let surface = self.role.wl_surface();
+        self.frame_requested = true;
 
         surface.frame(&self.qh, FrameCallbackData(surface.clone()));
     }
@@ -144,7 +146,10 @@ impl OpenWindow {
             }
 
             None => {
-                self.role.wl_surface().set_buffer_scale(self.scale as i32);
+                let Some(surface) = self.role.wl_surface() else {
+                    return false;
+                };
+                surface.set_buffer_scale(self.scale as i32);
 
                 (
                     self.width * self.scale as u32,
@@ -153,8 +158,11 @@ impl OpenWindow {
             }
         };
 
-        self.gpu
-            .draw(renderer.finish(), buffer_width, buffer_height)
+        let Some(gpu) = self.gpu.as_mut() else {
+            return false;
+        };
+
+        gpu.draw(renderer.finish(), buffer_width, buffer_height)
     }
 }
 

@@ -52,6 +52,7 @@ impl OutputHandler for WaylandState {
 
             window.request_frame();
         }
+        self.materialize_layers();
     }
 
     // dropping a window destroys its layer surface
