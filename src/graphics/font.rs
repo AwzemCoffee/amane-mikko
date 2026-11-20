@@ -14,6 +14,8 @@ const FALLBACK_FAMILIES: [&str; 2] = ["Noto Sans", "Noto Sans CJK JP"];
 static DEFAULT_FAMILY: LazyLock<Mutex<String>> =
     LazyLock::new(|| Mutex::new(String::from("sans-serif")));
 
+static DEFAULT_WEIGHT: LazyLock<Mutex<Weight>> = LazyLock::new(|| Mutex::new(Weight::Regular));
+
 static LOADED: LazyLock<Mutex<HashMap<String, FontRef<'static>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -39,6 +41,14 @@ pub fn set_default(family: &str) {
         .unwrap_or_else(PoisonError::into_inner);
 
     *default_family = String::from(family);
+}
+
+pub fn set_default_weight(weight: Weight) {
+    let mut default_weight = DEFAULT_WEIGHT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+
+    *default_weight = weight;
 }
 
 /// Registers an in-memory font file under `family` for all weights, bypassing fontconfig.
@@ -74,8 +84,13 @@ pub fn load_weighted(family: Option<&str>, weight: Weight) -> FontRef<'static> {
             .clone(),
     };
 
+    let base_weight = *DEFAULT_WEIGHT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let effective_weight = weight.shift(base_weight.index() - Weight::Regular.index());
+
     // bold and regular are different files, so each weight is kept apart
-    let key = format!("{family} {}", weight.style());
+    let key = format!("{family} {}", effective_weight.style());
 
     let mut loaded = LOADED.lock().unwrap_or_else(PoisonError::into_inner);
 
@@ -83,7 +98,7 @@ pub fn load_weighted(family: Option<&str>, weight: Weight) -> FontRef<'static> {
         return *font;
     }
 
-    let font = read(&family, weight);
+    let font = read(&family, effective_weight);
 
     loaded.insert(key, font);
 

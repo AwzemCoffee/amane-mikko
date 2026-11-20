@@ -27,6 +27,34 @@ impl Weight {
             Weight::Black => "Black",
         }
     }
+
+    pub(crate) fn index(self) -> i8 {
+        match self {
+            Weight::Thin => 0,
+            Weight::ExtraLight => 1,
+            Weight::Light => 2,
+            Weight::Regular => 3,
+            Weight::Medium => 4,
+            Weight::SemiBold => 5,
+            Weight::Bold => 6,
+            Weight::ExtraBold => 7,
+            Weight::Black => 8,
+        }
+    }
+
+    pub(crate) fn shift(self, delta: i8) -> Self {
+        match (self.index() + delta).clamp(0, 8) {
+            0 => Weight::Thin,
+            1 => Weight::ExtraLight,
+            2 => Weight::Light,
+            3 => Weight::Regular,
+            4 => Weight::Medium,
+            5 => Weight::SemiBold,
+            6 => Weight::Bold,
+            7 => Weight::ExtraBold,
+            _ => Weight::Black,
+        }
+    }
 }
 
 impl From<u16> for Weight {

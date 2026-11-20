@@ -29,7 +29,9 @@ pub use app::App;
 pub use dbus::{Argument, Bus, Method, Signal, Value};
 pub use files::watch_file;
 pub use full::Full;
-pub use graphics::font::register as register_font;
+pub use graphics::font::{
+    register as register_font, set_default as set_default_font, set_default_weight,
+};
 pub use graphics::{Cap, Color, Gradient, Weight};
 pub use input::cursor_names::{
     Crosshair, Default, Grab, Grabbing, Move, NotAllowed, Pointer, ResizeBottom, ResizeBottomLeft,
