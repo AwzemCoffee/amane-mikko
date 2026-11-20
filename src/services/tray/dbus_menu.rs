@@ -1,0 +1,144 @@
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use zbus::blocking::Connection;
+use zbus::zvariant::{OwnedValue, Structure, Value};
+
+use super::TrayMenuItem;
+
+const INTERFACE: &str = "com.canonical.dbusmenu";
+
+pub fn fetch_menu(
+    connection: &Connection,
+    service: &str,
+    menu_path: &str,
+) -> Vec<TrayMenuItem> {
+    let proxy = match zbus::blocking::Proxy::new(connection, service, menu_path, INTERFACE) {
+        Ok(proxy) => proxy,
+        Err(_) => return Vec::new(),
+    };
+
+    // Tell the app we are about to show the root menu (some apps lazily populate items here)
+    let _ = proxy.call::<_, _, bool>("AboutToShow", &(0i32));
+
+    let properties: Vec<&str> = Vec::new();
+    let reply: Result<(u32, (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>)), _> =
+        proxy.call("GetLayout", &(0i32, -1i32, properties));
+
+    let Ok((_revision, root)) = reply else {
+        return Vec::new();
+    };
+
+    root.2
+        .into_iter()
+        .filter_map(parse_node)
+        .filter(|item| item.visible)
+        .collect()
+}
+
+pub fn send_click(connection: &Connection, service: &str, menu_path: &str, item_id: i32) {
+    let Ok(proxy) = zbus::blocking::Proxy::new(connection, service, menu_path, INTERFACE) else {
+        return;
+    };
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+
+    let data = Value::from("");
+    let _ = proxy.call::<_, _, ()>("Event", &(item_id, "clicked", data, timestamp));
+}
+
+fn parse_node(value: OwnedValue) -> Option<TrayMenuItem> {
+    let structure = Structure::try_from(value).ok()?;
+    let mut fields = structure.into_fields().into_iter();
+
+    let id = i32::try_from(fields.next()?).ok()?;
+    let props_val = fields.next()?;
+    let children_val = fields.next()?;
+
+    let props: HashMap<String, OwnedValue> = props_val.try_into().ok().unwrap_or_default();
+    let raw_children: Vec<OwnedValue> = children_val.try_into().ok().unwrap_or_default();
+
+    let raw_label = props
+        .get("label")
+        .and_then(|v| <&str>::try_from(v).ok())
+        .unwrap_or_default();
+
+    let label = strip_mnemonic(raw_label);
+
+    let enabled = props
+        .get("enabled")
+        .and_then(|v| bool::try_from(v).ok())
+        .unwrap_or(true);
+
+    let visible = props
+        .get("visible")
+        .and_then(|v| bool::try_from(v).ok())
+        .unwrap_or(true);
+
+    let is_separator = props
+        .get("type")
+        .and_then(|v| <&str>::try_from(v).ok())
+        .is_some_and(|kind| kind == "separator");
+
+    let toggle_type = props
+        .get("toggle-type")
+        .and_then(|v| <&str>::try_from(v).ok())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let toggle_state = props
+        .get("toggle-state")
+        .and_then(|v| i32::try_from(v).ok())
+        .unwrap_or(-1);
+
+    let children = raw_children
+        .into_iter()
+        .filter_map(parse_node)
+        .filter(|item| item.visible)
+        .collect();
+
+    Some(TrayMenuItem {
+        id,
+        label,
+        enabled,
+        visible,
+        is_separator,
+        toggle_type,
+        toggle_state,
+        children,
+    })
+}
+
+/// Strips GTK/Qt `_` keyboard mnemonics (`"_Quit"` -> `"Quit"`, `"A__B"` -> `"A_B"`).
+pub fn strip_mnemonic(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '_' {
+            if chars.peek() == Some(&'_') {
+                out.push('_');
+                chars.next();
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_dbusmenu_mnemonics() {
+        assert_eq!(strip_mnemonic("_Quit"), "Quit");
+        assert_eq!(strip_mnemonic("Open _Settings"), "Open Settings");
+        assert_eq!(strip_mnemonic("Keep__Underscore"), "Keep_Underscore");
+    }
+}
