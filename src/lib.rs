@@ -50,7 +50,8 @@ pub use services::{
     AccessPoint, Action, Apps, Audio, Battery, Bluetooth, BluetoothDevice, Brightness,
     CaptureRegion, CapturedImage, Cpu, DesktopApp, Link, Lock, Media, MediaPlayer, Memory, Network,
     Notification, Notifications, Palette, Pam, PamConfig, PamError, PamMessage, PamMessageKind,
-    PamResult, Screenshot, Service, Tray, TrayItem, TrayMenuItem, Urgency, Workspace, Workspaces,
+    PamResult, Screenshot, Service, Session, Tray, TrayItem, TrayMenuItem, Urgency, Workspace,
+    Workspaces,
 };
 pub use style::{Fill, Image, Mask, Radius, Shadow};
 pub use widgets::{

@@ -14,6 +14,9 @@ const PAM_SERVICE: &str = "login";
 // what the lock screen shows while App::lock holds the session
 #[derive(Default)]
 pub struct Lock {
+    // true while the compositor holds an active ext-session-lock-v1 session
+    active: bool,
+
     checking: bool,
 
     // the last authentication attempt was rejected or failed
@@ -34,6 +37,11 @@ impl Service for Lock {
 }
 
 impl Lock {
+    // true while the session is locked by the compositor
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
     // an authentication attempt is in progress
     pub fn checking(&self) -> bool {
         self.checking
@@ -45,6 +53,15 @@ impl Lock {
 
     pub(crate) fn unlocked(&self) -> bool {
         self.unlocked
+    }
+
+    pub(crate) fn set_active(active: bool) {
+        let mut lock = Self::write();
+        if lock.active == active {
+            lock.quiet();
+            return;
+        }
+        lock.active = active;
     }
 
     /*
@@ -82,7 +99,14 @@ impl Lock {
      * and the screen unlocks only if it accepts the password
      */
     pub fn unlock(password: &str) {
-        let _ = Self::begin(PamConfig::new(PAM_SERVICE), Some(String::from(password)));
+        Self::unlock_with(PAM_SERVICE, password);
+    }
+
+    /// Authenticates using a specific PAM service name in `/etc/pam.d/`.
+    /// Falls back to `"login"` when `service` is empty or whitespace.
+    pub fn unlock_with(service: &str, password: &str) {
+        let service = normalize_pam_service(service);
+        let _ = Self::begin(PamConfig::new(service), Some(String::from(password)));
     }
 
     /// Starts interactive unlocking for the current user. Use `Pam` to read and answer prompts.
@@ -147,5 +171,36 @@ impl Lock {
         lock.checking = false;
         lock.failed = matches!(result, PamResult::Rejected(_) | PamResult::Error(_));
         lock.unlocked = !attempt.aborted() && *result == PamResult::Success;
+    }
+}
+
+fn normalize_pam_service(service: &str) -> &str {
+    let trimmed = service.trim();
+    if trimmed.is_empty() {
+        PAM_SERVICE
+    } else {
+        trimmed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_pam_service_defaults_blank_to_login() {
+        assert_eq!(normalize_pam_service(""), "login");
+        assert_eq!(normalize_pam_service("   "), "login");
+        assert_eq!(normalize_pam_service("  kultsi-lock "), "kultsi-lock");
+    }
+
+    #[test]
+    fn lock_active_transitions_cleanly() {
+        Lock::set_active(false);
+        assert!(!Lock::read().active());
+        Lock::set_active(true);
+        assert!(Lock::read().active());
+        Lock::set_active(false);
+        assert!(!Lock::read().active());
     }
 }
