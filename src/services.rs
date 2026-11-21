@@ -14,6 +14,7 @@ mod pam;
 mod screenshot;
 mod session;
 pub mod store;
+mod toplevel_capture;
 mod tray;
 mod worker;
 mod workspace;

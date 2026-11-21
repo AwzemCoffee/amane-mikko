@@ -102,6 +102,55 @@ impl CapturedImage {
         })
     }
 
+    /// Downscales the image to fit within `max_w × max_h` while preserving aspect ratio.
+    /// Returns a clone unchanged if already within bounds.
+    pub fn downscale_fit(&self, max_w: u32, max_h: u32) -> Self {
+        if self.width == 0 || self.height == 0 || max_w == 0 || max_h == 0 {
+            return self.clone();
+        }
+        if self.width <= max_w && self.height <= max_h {
+            return self.clone();
+        }
+        let scale = f32::min(
+            max_w as f32 / self.width as f32,
+            max_h as f32 / self.height as f32,
+        );
+        let new_w = ((self.width as f32 * scale).round() as u32).max(1);
+        let new_h = ((self.height as f32 * scale).round() as u32).max(1);
+        let mut rgba = Vec::with_capacity((new_w * new_h * 4) as usize);
+
+        for y in 0..new_h {
+            let y0 = (y as u64 * self.height as u64 / new_h as u64) as u32;
+            let y1 = (((y + 1) as u64 * self.height as u64 / new_h as u64) as u32)
+                .max(y0 + 1)
+                .min(self.height);
+            for x in 0..new_w {
+                let x0 = (x as u64 * self.width as u64 / new_w as u64) as u32;
+                let x1 = (((x + 1) as u64 * self.width as u64 / new_w as u64) as u32)
+                    .max(x0 + 1)
+                    .min(self.width);
+                let mut sum = [0u32; 4];
+                let count = (x1 - x0) * (y1 - y0);
+                for sy in y0..y1 {
+                    let row = (sy * self.width) as usize;
+                    for sx in x0..x1 {
+                        let idx = (row + sx as usize) * 4;
+                        for c in 0..4 {
+                            sum[c] += u32::from(self.rgba[idx + c]);
+                        }
+                    }
+                }
+                rgba.extend_from_slice(&sum.map(|v| (v / count) as u8));
+            }
+        }
+
+        Self {
+            width: new_w,
+            height: new_h,
+            rgba,
+        }
+    }
+
     /// Encode the RGBA8 image into PNG bytes.
     pub fn encode_png(&self) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
@@ -139,6 +188,12 @@ impl CapturedImage {
 pub struct Screenshot;
 
 impl Screenshot {
+    /// Capture a single foreign toplevel window matched by its `ext-foreign-toplevel-list-v1`
+    /// `identifier` using `ext-image-copy-capture-v1`.
+    pub fn capture_toplevel(identifier: &str) -> Result<CapturedImage, String> {
+        super::toplevel_capture::capture_toplevel(identifier)
+    }
+
     /// Capture an entire output (matched by `wl_output` name, or the first output if `None`)
     /// at its native physical resolution.
     pub fn capture_output(output_name: Option<&str>) -> Result<CapturedImage, String> {
@@ -732,7 +787,7 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ClipboardState {
 // Pixel format conversion
 // ---------------------------------------------------------------------------
 
-fn is_supported_shm_format(format: wl_shm::Format) -> bool {
+pub(super) fn is_supported_shm_format(format: wl_shm::Format) -> bool {
     matches!(
         format,
         wl_shm::Format::Argb8888
@@ -746,7 +801,7 @@ fn is_supported_shm_format(format: wl_shm::Format) -> bool {
     )
 }
 
-fn convert_shm_to_rgba(
+pub(super) fn convert_shm_to_rgba(
     src: &[u8],
     width: u32,
     height: u32,
@@ -855,5 +910,21 @@ mod tests {
         assert_eq!(cropped.height, 2);
         // First pixel should be (x=3, y=2)
         assert_eq!(&cropped.rgba[0..4], &[3, 2, 100, 255]);
+    }
+
+    #[test]
+    fn downscale_fit_preserves_aspect_ratio_and_leaves_small_images_untouched() {
+        let img = CapturedImage {
+            width: 8,
+            height: 4,
+            rgba: vec![200u8; 8 * 4 * 4],
+        };
+        let shrunk = img.downscale_fit(4, 4);
+        assert_eq!((shrunk.width, shrunk.height), (4, 2));
+        assert_eq!(shrunk.rgba.len(), 4 * 2 * 4);
+        assert_eq!(&shrunk.rgba[0..4], &[200, 200, 200, 200]);
+
+        let same = shrunk.downscale_fit(10, 10);
+        assert_eq!((same.width, same.height), (4, 2));
     }
 }
