@@ -5,8 +5,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use vello::wgpu::{
-    Adapter, Device, DeviceDescriptor, DeviceLostReason, Instance, InstanceDescriptor, MemoryHints,
-    Queue, RequestAdapterOptions, Surface,
+    Adapter, Backends, Device, DeviceDescriptor, DeviceLostReason, Instance, InstanceDescriptor,
+    MemoryHints, Queue, RequestAdapterOptions, Surface,
 };
 use vello::{AaSupport, RendererOptions};
 
@@ -48,7 +48,10 @@ pub fn instance(display: *mut c_void) -> Instance {
 fn open_instance(display: *mut c_void) -> Instance {
     let display = Box::new(Display::new(display));
 
-    let descriptor = InstanceDescriptor::new_with_display_handle_from_env(display);
+    let mut descriptor = InstanceDescriptor::new_with_display_handle_from_env(display);
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        descriptor.backends = Backends::VULKAN;
+    }
 
     Instance::new(descriptor)
 }

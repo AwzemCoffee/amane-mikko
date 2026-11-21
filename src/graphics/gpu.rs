@@ -163,3 +163,10 @@ impl Gpu {
         }
     }
 }
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        self.drawn.clear();
+        self.forget_unshown();
+    }
+}

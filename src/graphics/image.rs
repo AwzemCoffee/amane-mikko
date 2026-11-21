@@ -114,8 +114,11 @@ fn decode(key: Key) {
     changes::mark(TypeId::of::<Decoded>());
 }
 
+// thumbnails up to this many pixels (~1 MiB RGBA) stay cached; larger images are evicted on hide/swap
+const KEEP_THUMBNAIL_PIXELS: u64 = 512 * 512;
+
 /*
- * frees a full size image no window shows anymore; small copies stay,
+ * frees an image no window shows anymore; small thumbnails stay,
  * they cost little and decoding them again is slow
  */
 pub fn forget(image: &Arc<Bitmap>) {
@@ -123,8 +126,11 @@ pub fn forget(image: &Arc<Bitmap>) {
 
     loaded.retain(|(_, cover, _), kept| {
         let same = kept.as_ref().is_some_and(|kept| Arc::ptr_eq(kept, image));
+        if !same {
+            return true;
+        }
 
-        cover.is_some() || !same
+        cover.is_some_and(|(w, h)| u64::from(w) * u64::from(h) <= KEEP_THUMBNAIL_PIXELS)
     });
 }
 
@@ -222,4 +228,37 @@ fn decode_jpeg(bytes: &[u8]) -> Option<Bitmap> {
     };
 
     Some(bitmap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forget_evicts_full_and_large_thumbnails_but_keeps_small_thumbnails() {
+        let small = Arc::new(Bitmap::empty());
+        let large = Arc::new(Bitmap::empty());
+        let full = Arc::new(Bitmap::empty());
+
+        let small_key = (PathBuf::from("__test_small.png"), Some((340, 208)), 0);
+        let large_key = (PathBuf::from("__test_large.png"), Some((3840, 2160)), 0);
+        let full_key = (PathBuf::from("__test_full.png"), None, 0);
+
+        {
+            let mut loaded = LOADED.lock().unwrap_or_else(PoisonError::into_inner);
+            loaded.insert(small_key.clone(), Some(Arc::clone(&small)));
+            loaded.insert(large_key.clone(), Some(Arc::clone(&large)));
+            loaded.insert(full_key.clone(), Some(Arc::clone(&full)));
+        }
+
+        forget(&small);
+        forget(&large);
+        forget(&full);
+
+        let mut loaded = LOADED.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(loaded.contains_key(&small_key));
+        assert!(!loaded.contains_key(&large_key));
+        assert!(!loaded.contains_key(&full_key));
+        loaded.remove(&small_key);
+    }
 }

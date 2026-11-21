@@ -1,8 +1,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex, PoisonError};
 
 use fontconfig::{CharSet, Fontconfig, Pattern, UnicodeCoverage};
+use memmap2::Mmap;
 use swash::FontRef;
 use swash::scale::ScaleContext;
 
@@ -17,6 +19,10 @@ static DEFAULT_FAMILY: LazyLock<Mutex<String>> =
 static DEFAULT_WEIGHT: LazyLock<Mutex<Weight>> = LazyLock::new(|| Mutex::new(Weight::Regular));
 
 static LOADED: LazyLock<Mutex<HashMap<String, FontRef<'static>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// deduplicates backing font files by path so variable fonts and .ttc collections share one mapping
+static FONT_FILES: LazyLock<Mutex<HashMap<PathBuf, &'static [u8]>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // a variable font's slider positions, kept by the font's key; a font without any isn't listed
@@ -122,14 +128,29 @@ fn read(family: &str, weight: Weight) -> FontRef<'static> {
     open(&found.path.to_string_lossy(), index)
 }
 
-fn open(path: &str, index: u32) -> FontRef<'static> {
-    let bytes = std::fs::read(path).expect("failed to read font file");
+fn load_font_bytes(path: &str) -> &'static [u8] {
+    let key = PathBuf::from(path);
+    let mut files = FONT_FILES.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(&bytes) = files.get(&key) {
+        return bytes;
+    }
 
-    /*
-     * fonts stay loaded until the program exits,
-     * so leaking gives bytes that are valid forever
-     */
-    let bytes = Vec::leak(bytes);
+    // Prefer a read-only file mapping so font pages stay file-backed and shared across processes.
+    let bytes: &'static [u8] = std::fs::File::open(path)
+        .ok()
+        .and_then(|file| unsafe { Mmap::map(&file).ok() })
+        .map(|mmap| -> &'static [u8] { Box::leak(Box::new(mmap)) })
+        .unwrap_or_else(|| {
+            let data = std::fs::read(path).expect("failed to read font file");
+            Vec::leak(data)
+        });
+
+    files.insert(key, bytes);
+    bytes
+}
+
+fn open(path: &str, index: u32) -> FontRef<'static> {
+    let bytes = load_font_bytes(path);
 
     // fontconfig keeps a variable font's named style in the upper half, the file only knows the lower
     let font_index = index & 0xffff;
@@ -337,4 +358,23 @@ fn load_file(path: &str, index: u32) -> FontRef<'static> {
     loaded.insert(key, font);
 
     font
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn load_font_bytes_deduplicates_by_path() {
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp font file");
+        tmp.write_all(b"dummy-font-bytes").expect("write temp font");
+        let path = tmp.path().to_str().expect("utf-8 temp path");
+
+        let first = load_font_bytes(path);
+        let second = load_font_bytes(path);
+
+        assert_eq!(first, b"dummy-font-bytes");
+        assert!(std::ptr::eq(first.as_ptr(), second.as_ptr()));
+    }
 }
