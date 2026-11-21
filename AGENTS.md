@@ -16,10 +16,12 @@ Amane already provides `Notifications`, `Apps`, `Audio`, `Network`, `Bluetooth`,
 
 ## Context Pointers
 
+Read the relevant doc **before** editing framework internals or public primitives:
+
 - **Framework internals (`ARCHITECTURE.md`):** Read before modifying rendering, the `calloop` event loop, `Service` reactivity, or Wayland windowing.
-- **Amane API & widget docs (`docs/` and `https://mystiafin.github.io/amane/print.html`):** Consult when adding or changing public widgets, services, or styling APIs.
-- **Downstream shell (`/home/mikko/Projects/kultsi-shell/AGENTS.md` and `Docs/`):** Consult when verifying API requirements or feature boundaries needed by Kultsi Shell.
-- **Host compositor config (`/etc/nixos/home/umbriel.nix`):** Consult when testing Umbriel integration, fractional scaling (`DP-1` 4K @ `1.5x`), or `layer_rule` blur behavior.
+- **Amane API & widget docs (`docs/` and `https://mystiafin.github.io/amane/print.html`):** Read when adding or changing public widgets, services, or styling APIs.
+- **Downstream shell (`/home/mikko/Projects/kultsi-shell/AGENTS.md`, `Docs/architecture.md`, and `GLOSSARY.md`):** Read before changing framework seams or verifying requirements needed by Kultsi Shell.
+- **Host compositor config (`/etc/nixos/home/umbriel.nix`):** Read when testing Umbriel integration, fractional scaling (`DP-1` 4K @ `1.5x`), or `layer_rule` blur behavior.
 
 ## Conventions
 
