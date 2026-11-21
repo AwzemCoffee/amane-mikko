@@ -110,7 +110,8 @@ fn run_logind_loop(on_lock: Arc<dyn Fn() + Send + Sync + 'static>) {
                     return;
                 };
                 for msg in stream {
-                    if msg.is_ok() {
+                    if msg.is_ok() && decide_action(LogindEvent::SessionLock) == SleepAction::LockOnly
+                    {
                         on_session_lock();
                     }
                 }
